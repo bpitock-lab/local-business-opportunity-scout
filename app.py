@@ -52,6 +52,13 @@ ANCHOR_TAGS = {
     "public space": ["park", "playground", "library", "community_centre"],
 }
 
+NEWS_SIGNAL_TOPICS = {
+    "business openings and closures": "business OR restaurant OR retail OR shop OR opening OR closure",
+    "development and commercial change": "development OR construction OR permit OR redevelopment OR commercial",
+    "tourism and events demand": "tourism OR event OR festival OR hotel OR visitor",
+    "housing and affordability pressure": "rent OR housing OR affordability OR apartment OR real estate",
+}
+
 # -----------------------------
 # Utility helpers
 # -----------------------------
@@ -407,6 +414,67 @@ def classify_osm_records(osm_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFra
     return pd.DataFrame(supply_rows), pd.DataFrame(anchor_rows), pd.DataFrame(derived_rows)
 
 
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def get_gdelt_news_signals(area: str, county_name: str | None = None) -> pd.DataFrame:
+    """Pull open news/article signals from GDELT. This adds a broader business-context layer
+    without requiring a paid API key. It is intentionally summarized as directional evidence,
+    not treated as a complete local news census.
+    """
+    place_terms = [area]
+    if county_name and county_name not in area:
+        place_terms.append(county_name)
+    place_query = " OR ".join([f'"{x}"' for x in place_terms if x])
+    if not place_query:
+        return pd.DataFrame([{
+            "source": "GDELT news/article search",
+            "layer": "Local business news and market momentum",
+            "metric": "unavailable",
+            "text": "Article signal unavailable because the selected area could not be resolved.",
+        }])
+
+    rows = []
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    for topic, topic_query in NEWS_SIGNAL_TOPICS.items():
+        query = f"({place_query}) ({topic_query})"
+        params = {
+            "query": query,
+            "mode": "ArtList",
+            "format": "json",
+            "maxrecords": 20,
+            "sort": "HybridRel",
+            "sourcelang": "english",
+        }
+        data = safe_request_json(url, params=params, timeout=30)
+        if isinstance(data, dict) and "_error" in data:
+            rows.append({
+                "source": "GDELT news/article search",
+                "layer": "Local business news and market momentum",
+                "metric": topic,
+                "text": f"GDELT article search failed for {topic}: {data['_error']}",
+            })
+            continue
+        articles = data.get("articles", []) if isinstance(data, dict) else []
+        examples = []
+        domains = []
+        for article in articles[:5]:
+            title = normalize_text(article.get("title"))
+            domain = normalize_text(article.get("domain"))
+            date = normalize_text(article.get("seendate"))[:8]
+            if title:
+                examples.append(f"{title} ({domain}, {date})" if domain else title)
+            if domain:
+                domains.append(domain)
+        domain_sample = ", ".join(pd.Series(domains).drop_duplicates().head(5).tolist()) if domains else "no domains returned"
+        headline_sample = "; ".join(examples) if examples else "no example headlines returned"
+        rows.append({
+            "source": "GDELT open news/article search",
+            "layer": "Local business news and market momentum",
+            "metric": topic,
+            "text": f"Open article search returned {len(articles)} relevant article matches for '{topic}' near {area}. Example sources: {domain_sample}. Example headlines: {headline_sample}. Treat this as a directional signal for market momentum, local concerns, events, openings, construction, affordability pressure, or demand shifts.",
+        })
+    return pd.DataFrame(rows)
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def build_evidence_corpus(area: str, radius_m: int) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
     geo = geocode_area(area)
@@ -414,8 +482,9 @@ def build_evidence_corpus(area: str, radius_m: int) -> tuple[pd.DataFrame, dict,
     cbp = get_cbp_competition_context(geo.get("state_fips"), geo.get("county_fips"))
     osm_raw = get_osm_records(geo.get("lat"), geo.get("lon"), radius_m)
     supply, anchors, derived = classify_osm_records(osm_raw)
+    news = get_gdelt_news_signals(area, geo.get("county_name"))
 
-    frames = [acs, cbp, supply, anchors, derived]
+    frames = [acs, cbp, supply, anchors, derived, news]
     corpus = pd.concat([f for f in frames if f is not None and not f.empty], ignore_index=True)
     corpus["text"] = corpus["text"].fillna("").astype(str)
     corpus["doc_id"] = [f"DOC-{i+1:03d}" for i in range(len(corpus))]
@@ -525,7 +594,8 @@ with st.sidebar:
         st.session_state["ANTHROPIC_API_KEY"] = api_key_input
 
     area = st.text_input("Area", value="Seattle, WA")
-    radius_m = st.slider("Search radius around selected area center (meters)", min_value=1000, max_value=10000, value=4000, step=1000, help="Distance from the geocoded location center, measured in meters.")
+    radius_miles = st.slider("Search radius around selected area center (miles)", min_value=0.5, max_value=10.0, value=2.5, step=0.5, help="Distance from the geocoded location center, measured in miles.")
+    radius_m = int(radius_miles * 1609.34)
     budget = st.selectbox("Founder budget", ["Under $50,000", "$50,000-$100,000", "$100,000-$250,000", "$250,000+"], index=1)
     complexity = st.selectbox("Operating complexity tolerance", ["Low", "Medium", "High"], index=1)
     categories = st.multiselect(
@@ -539,13 +609,14 @@ with st.sidebar:
 with st.expander("What this prototype does"):
     st.markdown(
         """
-This app builds a local RAG corpus for the selected area from five open-data evidence layers:
+This app builds a local RAG corpus for the selected area from six open-data evidence layers:
 
 1. **Demand volume** from Census ACS population and local market context  
 2. **Pricing power proxies** from Census income, rent, and housing indicators  
 3. **Competitive intensity** from Census County Business Patterns and local category density  
 4. **Local business supply** from OpenStreetMap points of interest  
-5. **Foot-traffic and demand anchors** from OpenStreetMap transit, schools, parks, offices, health, and cultural amenities
+5. **Foot-traffic and demand anchors** from OpenStreetMap transit, schools, parks, offices, health, and cultural amenities  
+6. **Local news and market momentum** from open GDELT article search, summarized quantitatively by article-match counts and example headlines
 
 The goal is not to predict business success. The goal is to produce a fast, grounded shortlist of local business opportunities and risks that a founder could validate further. Users can either select specific areas of interest or leave the selection blank for a broader market scan.
         """
@@ -567,7 +638,7 @@ if run_button:
     col3.metric("Evidence layers", corpus["layer"].nunique() if not corpus.empty else 0)
 
     st.write(f"Matched area: **{geo.get('formatted', area)}**")
-    st.write(f"Search distance from selected location center: **{radius_m:,} meters** ({radius_m / 1609.34:.1f} miles)")
+    st.write(f"Search distance from selected location center: **{radius_miles:.1f} miles** ({radius_m:,} meters)")
     if geo.get("county_name"):
         st.write(f"County context: **{geo.get('county_name')} County**")
 
