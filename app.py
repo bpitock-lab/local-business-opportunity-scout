@@ -31,13 +31,16 @@ FALLBACK_MODELS = [
 ]
 
 BUSINESS_CATEGORY_TERMS = {
-    "Food & beverage": ["restaurant", "cafe", "bar", "fast_food", "bakery", "food_court", "ice_cream"],
-    "Fitness & wellness": ["gym", "fitness_centre", "yoga", "sports_centre", "spa", "massage"],
+    "Food & beverage": ["restaurant", "cafe", "bar", "fast_food", "bakery", "food_court", "ice_cream", "deli", "pub"],
+    "Fitness, health & wellness": ["gym", "fitness_centre", "yoga", "sports_centre", "spa", "massage", "clinic", "pharmacy", "doctors"],
     "Pet services": ["veterinary", "pet", "animal", "dog", "grooming"],
-    "Personal services": ["hairdresser", "beauty", "laundry", "dry_cleaning", "tailor", "barber"],
-    "Retail": ["clothes", "convenience", "supermarket", "department_store", "mall", "hardware", "electronics"],
-    "Home services": ["hardware", "doityourself", "furniture", "garden_centre", "car_repair"],
-    "Child/family services": ["school", "kindergarten", "childcare", "playground", "library"],
+    "Personal care & services": ["hairdresser", "beauty", "laundry", "dry_cleaning", "tailor", "barber", "nails"],
+    "Retail & convenience": ["clothes", "convenience", "supermarket", "department_store", "mall", "hardware", "electronics", "books", "gift", "florist"],
+    "Home, repair & maintenance": ["hardware", "doityourself", "furniture", "garden_centre", "car_repair", "bicycle", "car_wash"],
+    "Child, family & education": ["school", "kindergarten", "childcare", "playground", "library", "tutoring", "music_school"],
+    "Professional & financial services": ["bank", "atm", "office", "coworking", "lawyer", "accountant", "insurance", "real_estate"],
+    "Entertainment, culture & tourism": ["cinema", "theatre", "museum", "gallery", "attraction", "hotel", "arts_centre", "nightclub"],
+    "Mobility & transportation": ["fuel", "charging_station", "bicycle_rental", "car_rental", "parking", "taxi", "bus_station", "station"],
 }
 
 ANCHOR_TAGS = {
@@ -355,6 +358,13 @@ def classify_osm_records(osm_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFra
         empty = pd.DataFrame(columns=["source", "layer", "metric", "text"])
         return empty, empty, empty
 
+    # OpenStreetMap results vary by area. Some locations return only shop tags,
+    # only amenities, or sparse records. Ensure all expected tag columns exist
+    # so the app does not crash when one evidence type is missing.
+    for col in ["category", "amenity", "shop", "tourism", "leisure", "office", "public_transport", "name", "text"]:
+        if col not in osm_df.columns:
+            osm_df[col] = ""
+
     category_counts = osm_df["category"].fillna("unknown").value_counts().head(25)
     supply_rows = []
     for cat, count in category_counts.items():
@@ -515,13 +525,14 @@ with st.sidebar:
         st.session_state["ANTHROPIC_API_KEY"] = api_key_input
 
     area = st.text_input("Area", value="Seattle, WA")
-    radius_m = st.slider("OpenStreetMap search radius", min_value=1000, max_value=10000, value=4000, step=1000)
+    radius_m = st.slider("Search radius around selected area center (meters)", min_value=1000, max_value=10000, value=4000, step=1000, help="Distance from the geocoded location center, measured in meters.")
     budget = st.selectbox("Founder budget", ["Under $50,000", "$50,000-$100,000", "$100,000-$250,000", "$250,000+"], index=1)
     complexity = st.selectbox("Operating complexity tolerance", ["Low", "Medium", "High"], index=1)
     categories = st.multiselect(
-        "Categories of interest",
+        "Areas of interest (optional)",
         list(BUSINESS_CATEGORY_TERMS.keys()),
-        default=["Food & beverage", "Fitness & wellness", "Pet services", "Personal services"],
+        default=[],
+        help="Leave this blank to let the tool evaluate the market broadly across all supported categories.",
     )
     run_button = st.button("Build opportunity brief", type="primary")
 
@@ -536,7 +547,7 @@ This app builds a local RAG corpus for the selected area from five open-data evi
 4. **Local business supply** from OpenStreetMap points of interest  
 5. **Foot-traffic and demand anchors** from OpenStreetMap transit, schools, parks, offices, health, and cultural amenities
 
-The goal is not to predict business success. The goal is to produce a fast, grounded shortlist of local business opportunities and risks that a founder could validate further.
+The goal is not to predict business success. The goal is to produce a fast, grounded shortlist of local business opportunities and risks that a founder could validate further. Users can either select specific areas of interest or leave the selection blank for a broader market scan.
         """
     )
 
@@ -544,9 +555,7 @@ The goal is not to predict business success. The goal is to produce a fast, grou
 # Main app
 # -----------------------------
 if run_button:
-    if not categories:
-        st.warning("Select at least one business category of interest.")
-        st.stop()
+    category_context = ", ".join(categories) if categories else "No specific category selected; evaluate the market broadly across all supported local business categories."
 
     with st.spinner("Geocoding area and building local evidence corpus..."):
         corpus, geo, osm_raw = build_evidence_corpus(area, radius_m)
@@ -558,6 +567,7 @@ if run_button:
     col3.metric("Evidence layers", corpus["layer"].nunique() if not corpus.empty else 0)
 
     st.write(f"Matched area: **{geo.get('formatted', area)}**")
+    st.write(f"Search distance from selected location center: **{radius_m:,} meters** ({radius_m / 1609.34:.1f} miles)")
     if geo.get("county_name"):
         st.write(f"County context: **{geo.get('county_name')} County**")
 
@@ -581,7 +591,7 @@ if run_button:
     for i, question in enumerate(questions, start=1):
         st.markdown(f"### {i}. {question}")
         retrieved = retrieve(question, corpus, top_k=10)
-        prompt = make_rag_prompt(area, budget, complexity, ", ".join(categories), question, retrieved)
+        prompt = make_rag_prompt(area, budget, complexity, category_context, question, retrieved)
         with st.spinner("Generating evidence-backed answer..."):
             answer = call_claude(prompt, max_tokens=1300)
         st.markdown(answer)
@@ -592,25 +602,8 @@ if run_button:
     st.subheader("3. Final local business opportunity brief")
     findings = "\n\n".join([f"Question: {o['question']}\nAnswer: {o['answer']}" for o in outputs])
     with st.spinner("Synthesizing final customer brief..."):
-        final_brief = call_claude(final_brief_prompt(area, budget, complexity, ", ".join(categories), findings), max_tokens=1700)
+        final_brief = call_claude(final_brief_prompt(area, budget, complexity, category_context, findings), max_tokens=1700)
     st.markdown(final_brief)
-
-    st.subheader("4. Optional baseline vs. RAG comparison")
-    with st.expander("Show one baseline comparison for evaluation/demo evidence"):
-        eval_question = questions[0]
-        baseline = call_claude(make_baseline_prompt(area, budget, complexity, ", ".join(categories), eval_question), max_tokens=900)
-        rag_answer = outputs[0]["answer"]
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("#### Plain LLM baseline")
-            st.markdown(baseline)
-        with col_b:
-            st.markdown("#### RAG answer")
-            st.markdown(rag_answer)
-        st.info("For the final report, use the full notebook or app logs to score baseline vs. RAG on factual grounding, specificity, usefulness, and hallucination risk.")
-
-    csv = corpus.to_csv(index=False).encode("utf-8")
-    st.download_button("Download evidence corpus CSV", data=csv, file_name="local_business_scout_evidence_corpus.csv", mime="text/csv")
 
 else:
     st.info("Enter an area, set founder constraints, and click **Build opportunity brief**.")
