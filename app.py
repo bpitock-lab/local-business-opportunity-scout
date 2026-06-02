@@ -129,20 +129,17 @@ def get_nested(dct, keys, default=None):
 # -----------------------------
 # Geocoding and public data retrieval
 # -----------------------------
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def geocode_area(area: str) -> dict:
-    """Use Census geocoder first because it returns county/state geography. Fall back to Nominatim."""
-    census_url = "https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress"
-    params = {
-        "address": area,
-        "benchmark": "Public_AR_Current",
-        "vintage": "Current_Current",
-        "format": "json",
-    }
-    data = safe_request_json(census_url, params=params, timeout=30)
-    matches = get_nested(data, ["result", "addressMatches"], [])
-    if matches:
-        m = matches[0]
+    """Resolve user input into coordinates and county FIPS.
+
+    The app needs both lat/lon for OpenStreetMap and county FIPS for Census/CBP.
+    City-only inputs often fail in the Census one-line geocoder, so this function
+    tries three routes: Census address, Nominatim coordinates, then Census reverse
+    geocoding from coordinates.
+    """
+    def parse_census_match(m):
         coords = m.get("coordinates", {})
         counties = get_nested(m, ["geographies", "Counties"], []) or []
         county = counties[0] if counties else {}
@@ -159,24 +156,59 @@ def geocode_area(area: str) -> dict:
             "source": "Census Geocoder",
         }
 
-    # fallback: Nominatim, no FIPS
-    headers = {"User-Agent": "local-business-opportunity-scout-demo/1.0"}
+    census_url = "https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress"
+    params = {
+        "address": area,
+        "benchmark": "Public_AR_Current",
+        "vintage": "Current_Current",
+        "format": "json",
+    }
+    data = safe_request_json(census_url, params=params, timeout=25)
+    matches = get_nested(data, ["result", "addressMatches"], [])
+    if matches:
+        geo = parse_census_match(matches[0])
+        if geo.get("lat") and geo.get("lon"):
+            return geo
+
+    # Nominatim is better for city / neighborhood names. Then use Census reverse geocoder for FIPS.
+    headers = {"User-Agent": "local-business-opportunity-scout-demo/1.0 (educational prototype)"}
     n_url = "https://nominatim.openstreetmap.org/search"
-    n_data = safe_request_json(n_url, params={"q": area, "format": "json", "limit": 1}, headers=headers, timeout=30)
+    n_data = safe_request_json(
+        n_url,
+        params={"q": area, "format": "json", "limit": 1, "addressdetails": 1},
+        headers=headers,
+        timeout=25,
+    )
     if isinstance(n_data, list) and n_data:
         m = n_data[0]
+        lat = float(m.get("lat"))
+        lon = float(m.get("lon"))
+        formatted = m.get("display_name", area)
+        rev_url = "https://geocoding.geo.census.gov/geocoder/geographies/coordinates"
+        rev_params = {
+            "x": lon,
+            "y": lat,
+            "benchmark": "Public_AR_Current",
+            "vintage": "Current_Current",
+            "format": "json",
+        }
+        rev = safe_request_json(rev_url, params=rev_params, timeout=25)
+        counties = get_nested(rev, ["result", "geographies", "Counties"], []) or []
+        county = counties[0] if counties else {}
+        states = get_nested(rev, ["result", "geographies", "States"], []) or []
+        state_geo = states[0] if states else {}
         return {
             "input": area,
-            "formatted": m.get("display_name", area),
-            "lat": float(m.get("lat")),
-            "lon": float(m.get("lon")),
-            "state_fips": None,
-            "county_fips": None,
-            "county_name": None,
-            "source": "OpenStreetMap Nominatim",
+            "formatted": formatted,
+            "lat": lat,
+            "lon": lon,
+            "state_fips": state_geo.get("STATE") or county.get("STATE"),
+            "county_fips": county.get("COUNTY"),
+            "county_name": county.get("NAME"),
+            "source": "OpenStreetMap Nominatim + Census reverse geocoder",
         }
-    return {"input": area, "formatted": area, "lat": None, "lon": None, "state_fips": None, "county_fips": None, "county_name": None, "source": "unresolved"}
 
+    return {"input": area, "formatted": area, "lat": None, "lon": None, "state_fips": None, "county_fips": None, "county_name": None, "source": "unresolved"}
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def get_acs_county_context(state_fips: str, county_fips: str) -> pd.DataFrame:
@@ -300,9 +332,15 @@ def get_cbp_competition_context(state_fips: str, county_fips: str) -> pd.DataFra
     return pd.DataFrame(rows)
 
 
-def make_overpass_query(lat: float, lon: float, radius_m: int = 4000) -> str:
+
+def make_overpass_query(lat: float, lon: float, radius_m: int = 4000, detailed: bool = True) -> str:
+    """Build an Overpass query.
+
+    Detailed mode returns tagged examples. Count mode is lighter and can survive wider scans.
+    """
+    out_clause = "out center tags 650;" if detailed else "out count;"
     return f"""
-    [out:json][timeout:25];
+    [out:json][timeout:35];
     (
       node(around:{radius_m},{lat},{lon})[shop];
       node(around:{radius_m},{lat},{lon})[amenity];
@@ -317,22 +355,43 @@ def make_overpass_query(lat: float, lon: float, radius_m: int = 4000) -> str:
       way(around:{radius_m},{lat},{lon})[office];
       way(around:{radius_m},{lat},{lon})[public_transport];
     );
-    out center tags 500;
+    {out_clause}
     """
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
 def get_osm_records(lat: float, lon: float, radius_m: int = 4000) -> pd.DataFrame:
+    """Retrieve OSM records with endpoint fallbacks and a stability cap.
+
+    Very large radii can overwhelm Overpass. The UI allows up to 50 miles for the
+    user-facing scan, but the detailed POI sample is capped to keep the app runnable.
+    The app still reports the requested radius separately.
+    """
     if lat is None or lon is None:
-        return pd.DataFrame([{"name": "unavailable", "category": "unavailable", "text": "OpenStreetMap records unavailable because geocoding failed."}])
-    url = "https://overpass-api.de/api/interpreter"
-    query = make_overpass_query(lat, lon, radius_m)
-    try:
-        resp = requests.post(url, data={"data": query}, timeout=45)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        return pd.DataFrame([{"name": "retrieval failed", "category": "error", "text": f"OpenStreetMap / Overpass retrieval failed: {exc}"}])
+        return pd.DataFrame(columns=["name", "category", "amenity", "shop", "tourism", "leisure", "office", "public_transport", "lat", "lon", "text"])
+
+    effective_radius_m = min(int(radius_m), 25000)  # about 15.5 miles, broad enough for a city scan without timing out
+    endpoints = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://z.overpass-api.de/api/interpreter",
+    ]
+    last_error = None
+    data = None
+    query = make_overpass_query(lat, lon, effective_radius_m, detailed=True)
+    for url in endpoints:
+        try:
+            resp = requests.post(url, data={"data": query}, timeout=50, headers={"User-Agent": "local-business-opportunity-scout-demo/1.0"})
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if data is None:
+        # Return an empty but correctly-shaped dataframe. Do not put failure messages into the RAG corpus.
+        return pd.DataFrame(columns=["name", "category", "amenity", "shop", "tourism", "leisure", "office", "public_transport", "lat", "lon", "text", "retrieval_note"])
 
     rows = []
     for el in data.get("elements", []):
@@ -352,13 +411,17 @@ def get_osm_records(lat: float, lon: float, radius_m: int = 4000) -> pd.DataFram
             "public_transport": tags.get("public_transport", ""),
             "lat": lat_val,
             "lon": lon_val,
+            "retrieval_note": f"Detailed OSM sample used radius {effective_radius_m:,} meters; requested radius was {int(radius_m):,} meters.",
             "text": f"OpenStreetMap record: {name}; category={category}; tags={json.dumps({k:v for k,v in tags.items() if k in ['amenity','shop','tourism','leisure','office','public_transport','name','brand']})}",
         })
     df = pd.DataFrame(rows)
+    expected = ["name", "category", "amenity", "shop", "tourism", "leisure", "office", "public_transport", "lat", "lon", "text", "retrieval_note"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = ""
     if df.empty:
-        return pd.DataFrame([{"name": "no OSM records", "category": "none", "text": "No nearby OpenStreetMap points of interest were returned for this radius."}])
+        return pd.DataFrame(columns=expected)
     return df.drop_duplicates(subset=["name", "category"]).head(700)
-
 
 def classify_osm_records(osm_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if osm_df.empty:
@@ -415,49 +478,43 @@ def classify_osm_records(osm_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFra
 
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
 def get_gdelt_news_signals(area: str, county_name: str | None = None) -> pd.DataFrame:
-    """Pull open news/article signals from GDELT. This adds a broader business-context layer
-    without requiring a paid API key. It is intentionally summarized as directional evidence,
-    not treated as a complete local news census.
+    """Pull open article signals from GDELT when available.
+
+    GDELT can rate-limit public users. If it fails, return no rows rather than
+    letting failure notices pollute the RAG evidence used by Claude.
     """
     place_terms = [area]
     if county_name and county_name not in area:
         place_terms.append(county_name)
     place_query = " OR ".join([f'"{x}"' for x in place_terms if x])
     if not place_query:
-        return pd.DataFrame([{
-            "source": "GDELT news/article search",
-            "layer": "Local business news and market momentum",
-            "metric": "unavailable",
-            "text": "Article signal unavailable because the selected area could not be resolved.",
-        }])
+        return pd.DataFrame(columns=["source", "layer", "metric", "text"])
 
     rows = []
     url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    headers = {"User-Agent": "local-business-opportunity-scout-demo/1.0"}
     for topic, topic_query in NEWS_SIGNAL_TOPICS.items():
         query = f"({place_query}) ({topic_query})"
         params = {
             "query": query,
             "mode": "ArtList",
             "format": "json",
-            "maxrecords": 20,
+            "maxrecords": 10,
             "sort": "HybridRel",
             "sourcelang": "english",
         }
-        data = safe_request_json(url, params=params, timeout=30)
+        data = safe_request_json(url, params=params, headers=headers, timeout=20)
         if isinstance(data, dict) and "_error" in data:
-            rows.append({
-                "source": "GDELT news/article search",
-                "layer": "Local business news and market momentum",
-                "metric": topic,
-                "text": f"GDELT article search failed for {topic}: {data['_error']}",
-            })
             continue
         articles = data.get("articles", []) if isinstance(data, dict) else []
+        if not articles:
+            continue
         examples = []
         domains = []
-        for article in articles[:5]:
+        for article in articles[:4]:
             title = normalize_text(article.get("title"))
             domain = normalize_text(article.get("domain"))
             date = normalize_text(article.get("seendate"))[:8]
@@ -465,15 +522,16 @@ def get_gdelt_news_signals(area: str, county_name: str | None = None) -> pd.Data
                 examples.append(f"{title} ({domain}, {date})" if domain else title)
             if domain:
                 domains.append(domain)
-        domain_sample = ", ".join(pd.Series(domains).drop_duplicates().head(5).tolist()) if domains else "no domains returned"
-        headline_sample = "; ".join(examples) if examples else "no example headlines returned"
+        domain_sample = ", ".join(pd.Series(domains).drop_duplicates().head(4).tolist()) if domains else "sources not returned"
+        headline_sample = "; ".join(examples)
         rows.append({
             "source": "GDELT open news/article search",
             "layer": "Local business news and market momentum",
             "metric": topic,
-            "text": f"Open article search returned {len(articles)} relevant article matches for '{topic}' near {area}. Example sources: {domain_sample}. Example headlines: {headline_sample}. Treat this as a directional signal for market momentum, local concerns, events, openings, construction, affordability pressure, or demand shifts.",
+            "text": f"Open article search returned {len(articles)} article matches for '{topic}' near {area}. Example sources: {domain_sample}. Example headlines: {headline_sample}. Treat this as a directional signal for recent market momentum, not a complete article census.",
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=["source", "layer", "metric", "text"])
+
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def build_evidence_corpus(area: str, radius_m: int) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
@@ -486,7 +544,26 @@ def build_evidence_corpus(area: str, radius_m: int) -> tuple[pd.DataFrame, dict,
 
     frames = [acs, cbp, supply, anchors, derived, news]
     corpus = pd.concat([f for f in frames if f is not None and not f.empty], ignore_index=True)
+    if corpus.empty:
+        corpus = pd.DataFrame([{
+            "source": "System coverage note",
+            "layer": "Data availability",
+            "metric": "no records",
+            "text": "No public evidence records were retrieved for this run. Try a larger city, a smaller search radius, or rerun after public data services recover.",
+        }])
+    # Do not allow API failure text to dominate the RAG answer.
     corpus["text"] = corpus["text"].fillna("").astype(str)
+    failure_terms = ["retrieval failed", "rate-limited", "context unavailable", "parsing failed", "could not be retrieved"]
+    if len(corpus) > 1:
+        mask_failure = corpus["text"].str.lower().apply(lambda x: any(term in x for term in failure_terms))
+        corpus = corpus.loc[~mask_failure].copy()
+        if corpus.empty:
+            corpus = pd.DataFrame([{
+                "source": "System coverage note",
+                "layer": "Data availability",
+                "metric": "limited records",
+                "text": "Public data services returned limited coverage for this run. Rerun with a major city/county name or try again later.",
+            }])
     corpus["doc_id"] = [f"DOC-{i+1:03d}" for i in range(len(corpus))]
     corpus["area"] = area
     corpus["created_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -594,7 +671,7 @@ with st.sidebar:
         st.session_state["ANTHROPIC_API_KEY"] = api_key_input
 
     area = st.text_input("Area", value="Seattle, WA")
-    radius_miles = st.slider("Search radius around selected area center (miles)", min_value=0.5, max_value=10.0, value=2.5, step=0.5, help="Distance from the geocoded location center, measured in miles.")
+    radius_miles = st.slider("Search radius around selected area center (miles)", min_value=0.5, max_value=50.0, value=5.0, step=0.5, help="Distance from the geocoded location center, measured in miles.")
     radius_m = int(radius_miles * 1609.34)
     budget = st.selectbox("Founder budget", ["Under $50,000", "$50,000-$100,000", "$100,000-$250,000", "$250,000+"], index=1)
     complexity = st.selectbox("Operating complexity tolerance", ["Low", "Medium", "High"], index=1)
@@ -616,7 +693,7 @@ This app builds a local RAG corpus for the selected area from six open-data evid
 3. **Competitive intensity** from Census County Business Patterns and local category density  
 4. **Local business supply** from OpenStreetMap points of interest  
 5. **Foot-traffic and demand anchors** from OpenStreetMap transit, schools, parks, offices, health, and cultural amenities  
-6. **Local news and market momentum** from open GDELT article search, summarized quantitatively by article-match counts and example headlines
+6. **Optional local news and market momentum** from open GDELT article search when the public endpoint is available; failures are excluded from the RAG corpus so they do not distort recommendations
 
 The goal is not to predict business success. The goal is to produce a fast, grounded shortlist of local business opportunities and risks that a founder could validate further. Users can either select specific areas of interest or leave the selection blank for a broader market scan.
         """
@@ -639,6 +716,8 @@ if run_button:
 
     st.write(f"Matched area: **{geo.get('formatted', area)}**")
     st.write(f"Search distance from selected location center: **{radius_miles:.1f} miles** ({radius_m:,} meters)")
+    if radius_m > 25000:
+        st.caption("For app stability, the detailed OpenStreetMap POI sample is capped at about 15.5 miles; Census/CBP evidence still uses the matched county context.")
     if geo.get("county_name"):
         st.write(f"County context: **{geo.get('county_name')} County**")
 
