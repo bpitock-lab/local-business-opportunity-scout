@@ -670,10 +670,42 @@ with st.sidebar:
     if api_key_input:
         st.session_state["ANTHROPIC_API_KEY"] = api_key_input
 
+    st.markdown("### Market")
     area = st.text_input("Area", value="Seattle, WA")
-    radius_miles = st.slider("Search radius around selected area center (miles)", min_value=0.5, max_value=50.0, value=5.0, step=0.5, help="Distance from the geocoded location center, measured in miles.")
+    radius_miles = st.slider(
+        "Search radius around selected area center (miles)",
+        min_value=0.5,
+        max_value=50.0,
+        value=5.0,
+        step=0.5,
+        help="Distance from the geocoded location center, measured in miles.",
+    )
     radius_m = int(radius_miles * 1609.34)
-    budget = st.selectbox("Founder budget", ["Under $50,000", "$50,000-$100,000", "$100,000-$250,000", "$250,000+"], index=1)
+
+    st.markdown("### Founder constraints")
+    budget_min = st.number_input(
+        "Minimum available startup capital ($)",
+        min_value=0,
+        max_value=100_000_000,
+        value=50_000,
+        step=10_000,
+        help="Use 0 if there is no meaningful lower bound.",
+    )
+    budget_max = st.number_input(
+        "Maximum available startup capital ($)",
+        min_value=0,
+        max_value=100_000_000,
+        value=250_000,
+        step=10_000,
+        help="Set this as high as needed; the app no longer caps the founder at $250k.",
+    )
+    if budget_max < budget_min:
+        budget = f"At least ${budget_min:,.0f}; no valid upper bound entered because max is below min"
+    elif budget_min == 0:
+        budget = f"Up to ${budget_max:,.0f}"
+    else:
+        budget = f"${budget_min:,.0f} to ${budget_max:,.0f}"
+
     complexity = st.selectbox("Operating complexity tolerance", ["Low", "Medium", "High"], index=1)
     categories = st.multiselect(
         "Areas of interest (optional)",
@@ -681,7 +713,12 @@ with st.sidebar:
         default=[],
         help="Leave this blank to let the tool evaluate the market broadly across all supported categories.",
     )
-    run_button = st.button("Build opportunity brief", type="primary")
+
+    st.caption(f"Current budget range: **{budget}**")
+    run_button = st.button("Generate opportunity brief", type="primary", use_container_width=True)
+    if st.button("Clear cached public-data pulls", use_container_width=True, help="Use this if public data endpoints returned temporary errors or if you want a fresh data pull."):
+        st.cache_data.clear()
+        st.success("Cached public-data pulls cleared. Click Generate opportunity brief to rebuild the report.")
 
 with st.expander("What this prototype does"):
     st.markdown(
@@ -703,6 +740,10 @@ The goal is not to predict business success. The goal is to produce a fast, grou
 # Main app
 # -----------------------------
 if run_button:
+    if budget_max < budget_min:
+        st.error("Please set a maximum budget that is greater than or equal to the minimum budget.")
+        st.stop()
+
     category_context = ", ".join(categories) if categories else "No specific category selected; evaluate the market broadly across all supported local business categories."
 
     with st.spinner("Geocoding area and building local evidence corpus..."):
@@ -756,4 +797,4 @@ if run_button:
     st.markdown(final_brief)
 
 else:
-    st.info("Enter an area, set founder constraints, and click **Build opportunity brief**.")
+    st.info("Enter an area, set founder constraints, and click **Generate opportunity brief**.")
